@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,6 +122,70 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	}
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
+	}
+}
+
+func TestRFPlanStagesRevisesAndTunesAtInstant(t *testing.T) {
+	runtime := newTestRuntime(t)
+	pass := runtime.Passes.List()[0]
+	start, end := pass.Window.AOS, pass.Window.LOS
+	payload := func(revision int64) string {
+		return fmt.Sprintf(`{"pass_id":%q,"center_hz":2245000000,"polarization":"RHCP","revision":%d,`+
+			`"doppler_steps":[{"at":%q,"offset_hz":-10000},{"at":%q,"offset_hz":40000}]}`,
+			pass.ID, revision, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+	}
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	if response := requestJSON(t, server.Client(), "POST", server.URL+"/api/rf-chains/RF-01/plan", payload(1)); response.StatusCode != http.StatusOK {
+		t.Fatalf("stage revision 1: status %d", response.StatusCode)
+		response.Body.Close()
+	}
+	// Staging must not tune the live link.
+	if state, found := runtime.RF.State("RF-01"); !found || state.DopplerHz != 0 || state.PassID != "" {
+		t.Fatalf("staging a plan changed the live link: %#v", state)
+	}
+	// A newer revision amends the schedule.
+	if response := requestJSON(t, server.Client(), "POST", server.URL+"/api/rf-chains/RF-01/plan", payload(2)); response.StatusCode != http.StatusOK {
+		t.Fatalf("amend revision 2: status %d", response.StatusCode)
+	} else {
+		response.Body.Close()
+	}
+	// An older revision must not overwrite the current plan: 409, plan untouched.
+	if response := requestJSON(t, server.Client(), "POST", server.URL+"/api/rf-chains/RF-01/plan", payload(1)); response.StatusCode != http.StatusConflict {
+		t.Fatalf("stale revision: status %d, want 409", response.StatusCode)
+	} else {
+		response.Body.Close()
+	}
+	if plan, _ := runtime.RF.StagedPlan("RF-01"); plan.Revision != 2 {
+		t.Fatalf("stale revision overwrote current plan: rev %d", plan.Revision)
+	}
+	// A tune before the pass window must be rejected with 409 and not tune.
+	early := fmt.Sprintf(`{"at":%q}`, start.Add(-time.Minute).Format(time.RFC3339Nano))
+	if response := requestJSON(t, server.Client(), "POST", server.URL+"/api/rf-chains/RF-01/tune", early); response.StatusCode != http.StatusConflict {
+		t.Fatalf("out-of-window tune: status %d, want 409", response.StatusCode)
+	} else {
+		response.Body.Close()
+	}
+	// In-window tune takes the offset for that exact instant.
+	instant := start.Add(4 * time.Minute)
+	at := fmt.Sprintf(`{"at":%q}`, instant.Format(time.RFC3339Nano))
+	response := requestJSON(t, server.Client(), "POST", server.URL+"/api/rf-chains/RF-01/tune", at)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("in-window tune: status %d", response.StatusCode)
+	}
+	var state rf.State
+	decodeBody(t, response, &state)
+	plan, found := runtime.RF.StagedPlan("RF-01")
+	if !found {
+		t.Fatal("staged plan missing")
+	}
+	if want := rf.InterpolateDoppler(plan.Steps, instant); state.DopplerHz != want || state.PlanRevision != 2 {
+		t.Fatalf("tuned %d Hz (rev %d), want %d Hz rev 2", state.DopplerHz, state.PlanRevision, want)
 	}
 }
 

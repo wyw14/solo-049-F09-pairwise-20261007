@@ -11,6 +11,12 @@ type DopplerStep struct {
 	OffsetHz int64     `json:"offset_hz"`
 }
 
+// MaxDopplerOffsetHz bounds how far the receiver can be pulled off the center
+// frequency. Anything outside the capture range can never be tuned.
+const MaxDopplerOffsetHz int64 = 500_000
+
+// ValidateDopplerPlan validates a bare center/step pair for submissions that do
+// not carry a pass window yet (the steps are synthesized around "now").
 func ValidateDopplerPlan(centerHz int64, steps []DopplerStep) error {
 	if centerHz <= 0 || len(steps) < 2 {
 		return fmt.Errorf("frequency plan requires a center and at least two steps")
@@ -19,9 +25,35 @@ func ValidateDopplerPlan(centerHz int64, steps []DopplerStep) error {
 		return fmt.Errorf("Doppler steps must be ordered")
 	}
 	for _, step := range steps {
-		if step.OffsetHz > 500_000 || step.OffsetHz < -500_000 {
-			return fmt.Errorf("Doppler offset exceeds receiver capture range")
+		if err := ValidateOffset(step.OffsetHz); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// ValidateSchedule validates a windowed Doppler schedule: every offset must lie
+// inside the receiver capture range and the steps must bracket the whole pass
+// window so execution never has to extrapolate.
+func ValidateSchedule(centerHz int64, windowStart, windowEnd time.Time, steps []DopplerStep) error {
+	if err := ValidateDopplerPlan(centerHz, steps); err != nil {
+		return err
+	}
+	if windowStart.IsZero() || !windowEnd.After(windowStart) {
+		return fmt.Errorf("Doppler plan needs a pass time window with increasing boundaries")
+	}
+	if steps[0].At.After(windowStart) {
+		return fmt.Errorf("Doppler steps must cover the start of the pass window at %s", windowStart.Format(time.RFC3339))
+	}
+	if steps[len(steps)-1].At.Before(windowEnd) {
+		return fmt.Errorf("Doppler steps must cover the end of the pass window at %s", windowEnd.Format(time.RFC3339))
+	}
+	return nil
+}
+
+func ValidateOffset(offsetHz int64) error {
+	if offsetHz > MaxDopplerOffsetHz || offsetHz < -MaxDopplerOffsetHz {
+		return fmt.Errorf("Doppler offset %d Hz exceeds receiver capture range of ±%d Hz", offsetHz, MaxDopplerOffsetHz)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
+	"orbitlink/internal/rf"
 )
 
 func (r *Runtime) listPasses(writer http.ResponseWriter, _ *http.Request) {
@@ -102,6 +103,20 @@ func (r *Runtime) acquirePass(writer http.ResponseWriter, request *http.Request)
 	if err := decodeJSON(request, &input); err != nil {
 		writeError(writer, err)
 		return
+	}
+	// At execution time the chain takes the Doppler offset for the current
+	// station time from its staged plan. A refused tune (outside the capture
+	// window, stale revision, active link owned by another pass) aborts the
+	// attempt and leaves the current link untouched.
+	if plan, hasPlan := r.RF.StagedPlan(input.ChainID); hasPlan {
+		if plan.PassID != id {
+			writeError(writer, rf.Conflict("chain %s staged plan belongs to pass %s, not %s", input.ChainID, plan.PassID, id))
+			return
+		}
+		if _, err := r.RF.TuneAt(input.ChainID, r.Clock.Now()); err != nil {
+			writeError(writer, err)
+			return
+		}
 	}
 	attempt, err := r.Attempts.Begin(id, input.ChainID)
 	if err != nil {

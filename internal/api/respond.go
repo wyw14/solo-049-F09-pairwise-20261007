@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	"orbitlink/internal/rf"
 	"orbitlink/internal/scheduler"
 )
 
@@ -29,6 +30,10 @@ func writeError(writer http.ResponseWriter, err error) {
 	status := http.StatusUnprocessableEntity
 	var conflict *scheduler.ConflictError
 	if errors.As(err, &conflict) {
+		status = http.StatusConflict
+	}
+	var planConflict *rf.PlanConflictError
+	if errors.As(err, &planConflict) {
 		status = http.StatusConflict
 	}
 	writeJSON(writer, status, map[string]any{"error": err.Error(), "status": status})
