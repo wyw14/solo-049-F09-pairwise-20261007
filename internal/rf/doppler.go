@@ -26,6 +26,18 @@ func ValidateDopplerPlan(centerHz int64, steps []DopplerStep) error {
 	return nil
 }
 
+// ValidateWindowCoverage requires the stepped profile to span the whole pass
+// window so execution-time sampling never has to extrapolate.
+func ValidateWindowCoverage(window Window, steps []DopplerStep) error {
+	if len(steps) == 0 {
+		return fmt.Errorf("Doppler steps are required")
+	}
+	if steps[0].At.After(window.AOS) || steps[len(steps)-1].At.Before(window.LOS) {
+		return fmt.Errorf("Doppler steps must cover the pass window")
+	}
+	return nil
+}
+
 func InterpolateDoppler(steps []DopplerStep, at time.Time) int64 {
 	if len(steps) == 0 {
 		return 0

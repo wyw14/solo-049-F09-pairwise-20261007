@@ -46,6 +46,7 @@ func NewRouter(runtime *Runtime) (http.Handler, error) {
 		api.Post("/antennas/execute-due", runtime.executeDuePointing)
 		api.Post("/antennas/{antennaID}/stow", runtime.stowAntenna)
 		api.Get("/rf-chains", runtime.listRFChains)
+		api.Get("/rf-chains/{chainID}/doppler", runtime.sampleDoppler)
 		api.Post("/rf-chains/{chainID}/plan", runtime.applyRFPlan)
 		api.Post("/rf-chains/{chainID}/transmit", runtime.enableTransmit)
 		api.Get("/recordings", runtime.listRecordings)

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -30,20 +31,46 @@ func (r *Runtime) applyRFPlan(writer http.ResponseWriter, request *http.Request)
 		writeError(writer, err)
 		return
 	}
-	if len(input.DopplerSteps) == 0 {
-		now := time.Now().UTC()
-		input.DopplerSteps = []rf.DopplerStep{{At: now.Add(-time.Second), OffsetHz: input.DopplerHz}, {At: now.Add(time.Second), OffsetHz: input.DopplerHz}}
-	}
-	if err := rf.ValidateDopplerPlan(input.CenterHz, input.DopplerSteps); err != nil {
+	value, err := r.RequirePass(input.PassID)
+	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	state, err := r.RF.Apply(rf.Plan{PassID: input.PassID, ChainID: chi.URLParam(request, "chainID"), CenterHz: input.CenterHz, DopplerHz: rf.InterpolateDoppler(input.DopplerSteps, time.Now().UTC()), Polarization: input.Polarization})
+	plan := rf.Plan{
+		PassID:       input.PassID,
+		ChainID:      chi.URLParam(request, "chainID"),
+		CenterHz:     input.CenterHz,
+		DopplerHz:    input.DopplerHz,
+		Polarization: input.Polarization,
+		Steps:        input.DopplerSteps,
+		Window:       rf.Window{AOS: value.Window.AOS, LOS: value.Window.LOS, Revision: value.Window.Revision},
+	}
+	state, err := r.RF.Apply(plan)
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, state)
+}
+
+func (r *Runtime) sampleDoppler(writer http.ResponseWriter, request *http.Request) {
+	at := time.Now().UTC()
+	if raw := request.URL.Query().Get("at"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			writeError(writer, fmt.Errorf("invalid at parameter: %w", err))
+			return
+		}
+		at = parsed.UTC()
+	}
+	chainID := chi.URLParam(request, "chainID")
+	offset, found := r.RF.OffsetAt(chainID, at)
+	if !found {
+		writeError(writer, fmt.Errorf("RF chain %s not found", chainID))
+		return
+	}
+	state, _ := r.RF.State(chainID)
+	writeJSON(writer, http.StatusOK, map[string]any{"chain_id": chainID, "pass_id": state.PassID, "at": at, "offset_hz": offset, "window_revision": state.Window.Revision})
 }
 
 func (r *Runtime) enableTransmit(writer http.ResponseWriter, request *http.Request) {

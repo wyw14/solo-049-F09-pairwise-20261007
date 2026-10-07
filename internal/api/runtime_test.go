@@ -40,10 +40,11 @@ func TestOperationsPagesAndAPIsUseRuntimeState(t *testing.T) {
 func TestPassRevisionAcquisitionAndRecordingFlow(t *testing.T) {
 	runtime := newTestRuntime(t)
 	value := runtime.Passes.List()[0]
-	if _, err := runtime.RF.Apply(rf.Plan{PassID: value.ID, ChainID: "RF-01", CenterHz: 2_245_000_000, DopplerHz: 12_000, Polarization: rf.RightCircular}); err != nil {
+	window := rf.Window{AOS: value.Window.AOS, LOS: value.Window.LOS, Revision: value.Window.Revision}
+	if _, err := runtime.RF.Apply(rf.Plan{PassID: value.ID, ChainID: "RF-01", CenterHz: 2_245_000_000, DopplerHz: 12_000, Polarization: rf.RightCircular, Window: window}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.RF.Apply(rf.Plan{PassID: value.ID, ChainID: "RF-02", CenterHz: 2_245_000_000, DopplerHz: 12_050, Polarization: rf.RightCircular}); err != nil {
+	if _, err := runtime.RF.Apply(rf.Plan{PassID: value.ID, ChainID: "RF-02", CenterHz: 2_245_000_000, DopplerHz: 12_050, Polarization: rf.RightCircular, Window: window}); err != nil {
 		t.Fatal(err)
 	}
 	attempt, err := runtime.Attempts.Begin(value.ID, "RF-01")
@@ -121,6 +122,75 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	}
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
+	}
+}
+
+func TestRFPlanWindowedProfileAndSamplingAPI(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+	value := runtime.Passes.List()[0]
+	aos, los := value.Window.AOS, value.Window.LOS
+	mid := aos.Add(los.Sub(aos) / 2)
+
+	// Console-style request without steps stores a flat profile spanning the window.
+	flat, _ := json.Marshal(map[string]any{"pass_id": value.ID, "center_hz": 2_245_000_000, "doppler_hz": 12_000, "polarization": "RHCP"})
+	response := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/rf-chains/RF-01/plan", string(flat))
+	var flatState rf.State
+	decodeBody(t, response, &flatState)
+	if len(flatState.DopplerSteps) != 2 || !flatState.DopplerSteps[0].At.Equal(aos) || !flatState.DopplerSteps[1].At.Equal(los) {
+		t.Fatalf("flat profile does not span the pass window: %#v", flatState.DopplerSteps)
+	}
+
+	// A full stepped profile for the same window revision is accepted before transmit.
+	stepped, _ := json.Marshal(map[string]any{"pass_id": value.ID, "center_hz": 2_245_000_000, "polarization": "RHCP", "doppler_steps": []map[string]any{
+		{"at": aos, "offset_hz": 40_000}, {"at": mid, "offset_hz": 0}, {"at": los, "offset_hz": -40_000},
+	}})
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/rf-chains/RF-01/plan", string(stepped))
+	var state rf.State
+	decodeBody(t, response, &state)
+	if len(state.DopplerSteps) != 3 || state.Window.Revision != value.Window.Revision {
+		t.Fatalf("windowed profile not stored: %#v", state)
+	}
+
+	// Execution samples the stored profile by timestamp.
+	quarter := aos.Add(los.Sub(aos) / 4)
+	response, err = server.Client().Get(server.URL + "/api/rf-chains/RF-01/doppler?at=" + quarter.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sample struct {
+		OffsetHz int64 `json:"offset_hz"`
+	}
+	decodeBody(t, response, &sample)
+	if sample.OffsetHz != 20_000 {
+		t.Fatalf("sampled offset = %d, want 20000", sample.OffsetHz)
+	}
+
+	// Out-of-capture-range plans are rejected and leave the link untouched.
+	outOfRange, _ := json.Marshal(map[string]any{"pass_id": value.ID, "center_hz": 2_245_000_000, "doppler_steps": []map[string]any{
+		{"at": aos, "offset_hz": 40_000}, {"at": los, "offset_hz": 600_000},
+	}})
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/rf-chains/RF-01/plan", string(outOfRange))
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("out-of-range plan returned %d", response.StatusCode)
+	}
+	if current, _ := runtime.RF.State("RF-01"); len(current.DopplerSteps) != 3 {
+		t.Fatalf("out-of-range plan overwrote the link: %#v", current)
+	}
+
+	// Once transmit is enabled the plan is locked.
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/rf-chains/RF-01/transmit", "{}")
+	_ = response.Body.Close()
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/rf-chains/RF-01/plan", string(stepped))
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("post-transmit revision returned %d", response.StatusCode)
 	}
 }
 
